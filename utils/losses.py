@@ -51,3 +51,92 @@ def init_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
         return {'dirichlet': torch.abs(dirichlet).sum() / dirichlet_loss_divisor,
                 'diff_constraint_hom': torch.abs(diff_constraint_hom).sum()}
     return brat_hjivi_loss
+
+
+def init_transreach_brt_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
+    """Sequential HJI loss for TransReach (BRT setting)."""
+
+    def transreach_brt_hjivi_loss(
+        seq_state,
+        seq_value,
+        seq_dvdt,
+        seq_dvds,
+        seq_boundary_value,
+        seq_dirichlet_mask,
+        seq_output,
+    ):
+        if torch.all(seq_dirichlet_mask):
+            diff_constraint_hom = torch.zeros(
+                1, device=seq_value.device, dtype=seq_value.dtype
+            )
+        else:
+            ham = dynamics.hamiltonian(seq_state, seq_dvds)
+            if minWith == "zero":
+                ham = torch.clamp(ham, max=0.0)
+
+            diff_constraint_hom = seq_dvdt - ham
+            if minWith == "target":
+                diff_constraint_hom = torch.max(
+                    diff_constraint_hom, seq_value - seq_boundary_value
+                )
+            diff_constraint_hom = diff_constraint_hom[~seq_dirichlet_mask]
+
+        dirichlet = seq_value[seq_dirichlet_mask] - seq_boundary_value[seq_dirichlet_mask]
+        if dynamics.deepreach_model == "exact":
+            if torch.all(seq_dirichlet_mask):
+                dirichlet = seq_output.squeeze(dim=-1)[seq_dirichlet_mask] - 0.0
+            else:
+                return {"diff_constraint_hom": torch.abs(diff_constraint_hom).mean()}
+
+        return {
+            "dirichlet": torch.abs(dirichlet).mean() / dirichlet_loss_divisor,
+            "diff_constraint_hom": torch.abs(diff_constraint_hom).mean(),
+        }
+
+    return transreach_brt_hjivi_loss
+
+
+def init_transreach_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor):
+    """Sequential HJI-VI loss for TransReach (BRAT setting)."""
+
+    def transreach_brat_hjivi_loss(
+        seq_state,
+        seq_value,
+        seq_dvdt,
+        seq_dvds,
+        seq_boundary_value,
+        seq_reach_value,
+        seq_avoid_value,
+        seq_dirichlet_mask,
+        seq_output,
+    ):
+        if torch.all(seq_dirichlet_mask):
+            diff_constraint_hom = torch.zeros(
+                1, device=seq_value.device, dtype=seq_value.dtype
+            )
+        else:
+            ham = dynamics.hamiltonian(seq_state, seq_dvds)
+            if minWith == "zero":
+                ham = torch.clamp(ham, max=0.0)
+
+            diff_constraint_hom = seq_dvdt - ham
+            if minWith == "target":
+                diff_constraint_hom = torch.min(
+                    torch.max(diff_constraint_hom, seq_value - seq_reach_value),
+                    seq_value + seq_avoid_value,
+                )
+            diff_constraint_hom = diff_constraint_hom[~seq_dirichlet_mask]
+
+        dirichlet = seq_value[seq_dirichlet_mask] - seq_boundary_value[seq_dirichlet_mask]
+        if dynamics.deepreach_model == "exact":
+            if torch.all(seq_dirichlet_mask):
+                dirichlet = seq_output.squeeze(dim=-1)[seq_dirichlet_mask] - 0.0
+            else:
+                return {"diff_constraint_hom": torch.abs(diff_constraint_hom).mean()}
+
+        return {
+            "dirichlet": torch.abs(dirichlet).mean() / dirichlet_loss_divisor,
+            "diff_constraint_hom": torch.abs(diff_constraint_hom).mean(),
+        }
+
+    return transreach_brat_hjivi_loss

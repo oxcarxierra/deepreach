@@ -143,22 +143,122 @@ class Experiment(ABC):
                     gt = {key: value.to(device) for key, value in gt.items()}
 
                     model_results = self.model({'coords': model_input['model_coords']})
-
-                    states = self.dataset.dynamics.input_to_coord(model_results['model_in'].detach())[..., 1:]
-                    values = self.dataset.dynamics.io_to_value(model_results['model_in'].detach(), model_results['model_out'].squeeze(dim=-1))
-                    dvs = self.dataset.dynamics.io_to_dv(model_results['model_in'], model_results['model_out'].squeeze(dim=-1))
-                    boundary_values = gt['boundary_values']
-                    if self.dataset.dynamics.loss_type == 'brat_hjivi':
-                        reach_values = gt['reach_values']
-                        avoid_values = gt['avoid_values']
                     dirichlet_masks = gt['dirichlet_masks']
+                    use_sequential_loss = (
+                        "seq_model_in" in model_results and "seq_model_out" in model_results
+                    )
 
-                    if self.dataset.dynamics.loss_type == 'brt_hjivi':
-                        losses = loss_fn(states, values, dvs[..., 0], dvs[..., 1:], boundary_values, dirichlet_masks, model_results['model_out'])
-                    elif self.dataset.dynamics.loss_type == 'brat_hjivi':
-                        losses = loss_fn(states, values, dvs[..., 0], dvs[..., 1:], boundary_values, reach_values, avoid_values, dirichlet_masks, model_results['model_out'])
+                    if use_sequential_loss:
+                        seq_model_in = model_results["seq_model_in"]
+                        seq_model_out = model_results["seq_model_out"]
+
+                        if "seq_model_in_flat" in model_results and "seq_model_out_flat" in model_results:
+                            # Use exact graph tensors used during forward for jacobian stability.
+                            seq_model_in_flat = model_results["seq_model_in_flat"]
+                            seq_model_out_flat = model_results["seq_model_out_flat"]
+                        else:
+                            seq_model_in_flat = seq_model_in.reshape(-1, seq_model_in.shape[-1])
+                            seq_model_out_flat = seq_model_out.reshape(
+                                -1, seq_model_out.shape[-1]
+                            )
+                        seq_model_out_flat_squeezed = seq_model_out_flat.squeeze(dim=-1)
+
+                        seq_states = self.dataset.dynamics.input_to_coord(
+                            seq_model_in_flat.detach()
+                        )[..., 1:]
+                        seq_values = self.dataset.dynamics.io_to_value(
+                            seq_model_in_flat.detach(), seq_model_out_flat_squeezed
+                        )
+                        seq_dvs = self.dataset.dynamics.io_to_dv(
+                            seq_model_in_flat, seq_model_out_flat_squeezed
+                        )
+                        seq_boundary_values = self.dataset.dynamics.boundary_fn(seq_states)
+
+                        if torch.all(dirichlet_masks):
+                            # Pretraining phase: skip PDE loss, mirror baseline behavior.
+                            seq_dirichlet_masks = torch.ones(
+                                seq_model_in.shape[:-1],
+                                dtype=torch.bool,
+                                device=seq_model_in.device,
+                            )
+                        else:
+                            seq_dirichlet_masks = torch.zeros(
+                                seq_model_in.shape[:-1],
+                                dtype=torch.bool,
+                                device=seq_model_in.device,
+                            )
+                            # Only the first pseudo token corresponds to the anchor time.
+                            seq_dirichlet_masks[..., 0] = dirichlet_masks
+
+                        seq_dirichlet_masks_flat = seq_dirichlet_masks.reshape(-1)
+
+                        if self.dataset.dynamics.loss_type == "brt_hjivi":
+                            losses = loss_fn(
+                                seq_states,
+                                seq_values,
+                                seq_dvs[..., 0],
+                                seq_dvs[..., 1:],
+                                seq_boundary_values,
+                                seq_dirichlet_masks_flat,
+                                seq_model_out_flat,
+                            )
+                        elif self.dataset.dynamics.loss_type == "brat_hjivi":
+                            seq_reach_values = self.dataset.dynamics.reach_fn(seq_states)
+                            seq_avoid_values = self.dataset.dynamics.avoid_fn(seq_states)
+                            losses = loss_fn(
+                                seq_states,
+                                seq_values,
+                                seq_dvs[..., 0],
+                                seq_dvs[..., 1:],
+                                seq_boundary_values,
+                                seq_reach_values,
+                                seq_avoid_values,
+                                seq_dirichlet_masks_flat,
+                                seq_model_out_flat,
+                            )
+                        else:
+                            raise NotImplementedError
                     else:
-                        raise NotImplementedError
+                        states = self.dataset.dynamics.input_to_coord(
+                            model_results["model_in"].detach()
+                        )[..., 1:]
+                        values = self.dataset.dynamics.io_to_value(
+                            model_results["model_in"].detach(),
+                            model_results["model_out"].squeeze(dim=-1),
+                        )
+                        dvs = self.dataset.dynamics.io_to_dv(
+                            model_results["model_in"],
+                            model_results["model_out"].squeeze(dim=-1),
+                        )
+                        boundary_values = gt["boundary_values"]
+                        if self.dataset.dynamics.loss_type == "brat_hjivi":
+                            reach_values = gt["reach_values"]
+                            avoid_values = gt["avoid_values"]
+
+                        if self.dataset.dynamics.loss_type == "brt_hjivi":
+                            losses = loss_fn(
+                                states,
+                                values,
+                                dvs[..., 0],
+                                dvs[..., 1:],
+                                boundary_values,
+                                dirichlet_masks,
+                                model_results["model_out"],
+                            )
+                        elif self.dataset.dynamics.loss_type == "brat_hjivi":
+                            losses = loss_fn(
+                                states,
+                                values,
+                                dvs[..., 0],
+                                dvs[..., 1:],
+                                boundary_values,
+                                reach_values,
+                                avoid_values,
+                                dirichlet_masks,
+                                model_results["model_out"],
+                            )
+                        else:
+                            raise NotImplementedError
                     
                     if use_lbfgs:
                         def closure():
