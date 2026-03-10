@@ -4,20 +4,13 @@ import os
 import shutil
 import time
 import math
-import pickle
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
-import plotly.express as px
-import scipy.io as spio
 
 from abc import ABC, abstractmethod
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm.autonotebook import tqdm
 from collections import OrderedDict
-from datetime import datetime
-from sklearn import svm 
 from utils import diff_operators
 from utils.error_evaluators import scenario_optimization, ValueThresholdValidator, MultiValidator, MLPConditionedValidator, target_fraction, MLP, MLPValidator, SliceSampleGenerator
 
@@ -111,15 +104,9 @@ class Experiment(ABC):
 
         training_dir = os.path.join(self.experiment_dir, 'training')
         
-        summaries_dir = os.path.join(training_dir, 'summaries')
-        if not os.path.exists(summaries_dir):
-            os.makedirs(summaries_dir)
-
         checkpoints_dir = os.path.join(training_dir, 'checkpoints')
         if not os.path.exists(checkpoints_dir):
             os.makedirs(checkpoints_dir)
-
-        writer = SummaryWriter(summaries_dir)
 
         total_steps = 0
 
@@ -149,72 +136,43 @@ class Experiment(ABC):
                     )
 
                     if use_sequential_loss:
-                        seq_model_in = model_results["seq_model_in"]
-                        seq_model_out = model_results["seq_model_out"]
-
-                        if "seq_model_in_flat" in model_results and "seq_model_out_flat" in model_results:
-                            # Use exact graph tensors used during forward for jacobian stability.
-                            seq_model_in_flat = model_results["seq_model_in_flat"]
-                            seq_model_out_flat = model_results["seq_model_out_flat"]
-                        else:
-                            seq_model_in_flat = seq_model_in.reshape(-1, seq_model_in.shape[-1])
-                            seq_model_out_flat = seq_model_out.reshape(
-                                -1, seq_model_out.shape[-1]
-                            )
-                        seq_model_out_flat_squeezed = seq_model_out_flat.squeeze(dim=-1)
-
-                        seq_states = self.dataset.dynamics.input_to_coord(
-                            seq_model_in_flat.detach()
+                        states = self.dataset.dynamics.input_to_coord(
+                            model_results["model_in"].detach()
                         )[..., 1:]
-                        seq_values = self.dataset.dynamics.io_to_value(
-                            seq_model_in_flat.detach(), seq_model_out_flat_squeezed
+                        values = self.dataset.dynamics.io_to_value(
+                            model_results["model_in"].detach(),
+                            model_results["model_out"].squeeze(dim=-1),
                         )
-                        seq_dvs = self.dataset.dynamics.io_to_dv(
-                            seq_model_in_flat, seq_model_out_flat_squeezed
+                        dvs = self.dataset.dynamics.io_to_dv(
+                            model_results["model_in"],
+                            model_results["model_out"].squeeze(dim=-1),
                         )
-                        seq_boundary_values = self.dataset.dynamics.boundary_fn(seq_states)
-
-                        if torch.all(dirichlet_masks):
-                            # Pretraining phase: skip PDE loss, mirror baseline behavior.
-                            seq_dirichlet_masks = torch.ones(
-                                seq_model_in.shape[:-1],
-                                dtype=torch.bool,
-                                device=seq_model_in.device,
-                            )
-                        else:
-                            seq_dirichlet_masks = torch.zeros(
-                                seq_model_in.shape[:-1],
-                                dtype=torch.bool,
-                                device=seq_model_in.device,
-                            )
-                            # Only the first pseudo token corresponds to the anchor time.
-                            seq_dirichlet_masks[..., 0] = dirichlet_masks
-
-                        seq_dirichlet_masks_flat = seq_dirichlet_masks.reshape(-1)
+                        boundary_values = gt["boundary_values"]
+                        if self.dataset.dynamics.loss_type == "brat_hjivi":
+                            reach_values = gt["reach_values"]
+                            avoid_values = gt["avoid_values"]
 
                         if self.dataset.dynamics.loss_type == "brt_hjivi":
                             losses = loss_fn(
-                                seq_states,
-                                seq_values,
-                                seq_dvs[..., 0],
-                                seq_dvs[..., 1:],
-                                seq_boundary_values,
-                                seq_dirichlet_masks_flat,
-                                seq_model_out_flat,
+                                states,
+                                values,
+                                dvs[..., 0],
+                                dvs[..., 1:],
+                                boundary_values,
+                                dirichlet_masks,
+                                model_results["model_out"],
                             )
                         elif self.dataset.dynamics.loss_type == "brat_hjivi":
-                            seq_reach_values = self.dataset.dynamics.reach_fn(seq_states)
-                            seq_avoid_values = self.dataset.dynamics.avoid_fn(seq_states)
                             losses = loss_fn(
-                                seq_states,
-                                seq_values,
-                                seq_dvs[..., 0],
-                                seq_dvs[..., 1:],
-                                seq_boundary_values,
-                                seq_reach_values,
-                                seq_avoid_values,
-                                seq_dirichlet_masks_flat,
-                                seq_model_out_flat,
+                                states,
+                                values,
+                                dvs[..., 0],
+                                dvs[..., 1:],
+                                boundary_values,
+                                reach_values,
+                                avoid_values,
+                                dirichlet_masks,
+                                model_results["model_out"],
                             )
                         else:
                             raise NotImplementedError
@@ -315,7 +273,6 @@ class Experiment(ABC):
                             den = torch.mean(torch.abs(grads_dirichlet))
                             new_weight = 0.9*new_weight + 0.1*num/den
                             losses['dirichlet'] = new_weight*losses['dirichlet']
-                        writer.add_scalar('weight_scaling', new_weight, total_steps)
 
                     # import ipdb; ipdb.set_trace()
 
@@ -323,14 +280,9 @@ class Experiment(ABC):
                     for loss_name, loss in losses.items():
                         single_loss = loss.mean()
 
-                        if loss_name == 'dirichlet':
-                            writer.add_scalar(loss_name, single_loss/new_weight, total_steps)
-                        else:
-                            writer.add_scalar(loss_name, single_loss, total_steps)
                         train_loss += single_loss
 
                     train_losses.append(train_loss.item())
-                    writer.add_scalar("total_train_loss", train_loss, total_steps)
 
                     if not total_steps % steps_til_summary:
                         torch.save(self.model.state_dict(),

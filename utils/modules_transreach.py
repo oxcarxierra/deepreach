@@ -236,18 +236,25 @@ class TransReachBVPNet(nn.Module):
         if params is None:
             params = OrderedDict(self.named_parameters())
 
-        coords_org = model_input["coords"].clone().detach()
-        original_shape = coords_org.shape[:-1]
-        input_dim = coords_org.shape[-1]
+        original_shape = model_input["coords"].shape[:-1]
+        input_dim = model_input["coords"].shape[-1]
 
-        coords_flat = coords_org.reshape(-1, input_dim)
-        seq_coords = self._generate_pseudo_sequence(coords_flat)
-        # Use a flat leaf tensor as the autograd anchor to avoid view-related grad issues.
-        seq_coords_flat = seq_coords.reshape(-1, input_dim).clone().detach().requires_grad_(True)
-        seq_coords = seq_coords_flat.reshape(-1, self.pseudo_steps, input_dim)
+        # Leaf for autograd: same shape as model_in so jacobian(model_out, model_in) works.
+        # model_out will flow through anchor_coords_flat (a view of this leaf) → leaf.
+        anchor_coords = model_input["coords"].clone().detach().requires_grad_(True)  # [*original_shape, D]
+        anchor_coords_flat = anchor_coords.reshape(-1, input_dim)  # [N, D], view of leaf
+
+        # Generate pseudo-sequence from the detached coords (context tokens only).
+        coords_flat = anchor_coords_flat.detach()  # [N, D], no grad for sequence generation
+        seq_coords = self._generate_pseudo_sequence(coords_flat)  # [N, K, D]
+
+        # Non-anchor tokens are detached context; PDE gradient only flows through anchor.
+        other_coords = seq_coords[:, 1:, :].detach()  # [N, K-1, D]
+        # Build the full sequence: token 0 = differentiable anchor, rest = detached context.
+        seq_coords_fwd = torch.cat([anchor_coords_flat.unsqueeze(1), other_coords], dim=1)  # [N, K, D]
 
         # [N, K, D] -> [N, K, H]
-        mixed_tokens = self.mixer(seq_coords)
+        mixed_tokens = self.mixer(seq_coords_fwd)
         mixed_tokens = mixed_tokens + self.step_embedding[:, : self.pseudo_steps]
 
         memory = mixed_tokens
@@ -260,23 +267,16 @@ class TransReachBVPNet(nn.Module):
             decoded = layer(decoded, memory)
         decoded = self.decoder_out_act(decoded)
 
-        seq_outputs_flat = self.output_layer(decoded)  # [N, K, 1]
+        seq_outputs = self.output_layer(decoded)  # [N, K, 1]
 
-        anchor_inputs_flat = seq_coords[:, 0, :]
-        anchor_outputs_flat = seq_outputs_flat[:, 0, :]
-
-        seq_model_in = seq_coords.reshape(*original_shape, self.pseudo_steps, input_dim)
-        seq_model_out = seq_outputs_flat.reshape(*original_shape, self.pseudo_steps, self.out_features)
-        seq_model_out_flat = seq_outputs_flat.reshape(-1, self.out_features)
-        model_in = anchor_inputs_flat.reshape(*original_shape, input_dim)
-        model_out = anchor_outputs_flat.reshape(*original_shape, self.out_features)
+        model_in = anchor_coords  # leaf, shape [*original_shape, D]
+        model_out = seq_outputs[:, 0, :].reshape(*original_shape, self.out_features)
+        seq_model_in = seq_coords_fwd.reshape(*original_shape, self.pseudo_steps, input_dim)
+        seq_model_out = seq_outputs.reshape(*original_shape, self.pseudo_steps, self.out_features)
 
         return {
             "model_in": model_in,
             "model_out": model_out,
             "seq_model_in": seq_model_in,
             "seq_model_out": seq_model_out,
-            # Provide exact tensors used in graph for stable autograd jacobians.
-            "seq_model_in_flat": seq_coords_flat,
-            "seq_model_out_flat": seq_model_out_flat,
         }
